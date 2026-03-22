@@ -6,13 +6,6 @@ from dataclasses import dataclass, field
 
 @dataclass
 class NonceStore:
-    """
-    In memory nonce store with ttl.
-
-    This protects against replay attacks for a single server instance.
-    For multi instance, move this to a shared store later.
-    """
-
     ttl_seconds: int = 300
     _nonces: dict[str, float] = field(default_factory=dict)
 

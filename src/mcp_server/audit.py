@@ -9,12 +9,6 @@ from typing import Any
 
 @dataclass(frozen=True)
 class AuditLogger:
-    """
-    JSON line audit logger.
-
-    Each call appends one JSON object per line.
-    """
-
     path: Path
 
     def log(self, event: dict[str, Any]) -> None:

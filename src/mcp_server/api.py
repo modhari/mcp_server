@@ -25,10 +25,11 @@ from mcp_server.security import (
     require_header,
 )
 
+
 @dataclass(frozen=True)
 class McpServerConfig:
     auth: McpAuthConfig
-    audit_path: Path = Path("var/audit/mcp_audit.jsonl")
+    audit_path: Path = Path("/tmp/mcp_audit.jsonl")
     nonce_ttl_seconds: int = 300
 
 
@@ -47,7 +48,7 @@ class McpHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_POST(self) -> None:  # noqa: N802
+    def do_POST(self) -> None:
         cfg: McpServerConfig = self.server.mcp_config  # type: ignore[attr-defined]
         audit: AuditLogger = self.server.mcp_audit  # type: ignore[attr-defined]
         nonces: NonceStore = self.server.mcp_nonces  # type: ignore[attr-defined]
@@ -170,8 +171,8 @@ class McpHandler(BaseHTTPRequestHandler):
             )
 
     def _evaluate_plan_dicts(
-        self, 
-        plan: dict[str, Any], 
+        self,
+        plan: dict[str, Any],
         inventory: dict[str, Any],
     ) -> dict[str, Any]:
         _ = plan

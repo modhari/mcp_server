@@ -4,23 +4,12 @@ import hashlib
 import hmac
 from dataclasses import dataclass
 from typing import Any
+
 from mcp_server.errors import McpValidationError
+
 
 @dataclass(frozen=True)
 class McpAuthConfig:
-    """
-    Auth and integrity settings for MCP.
-
-    auth_token
-    Shared bearer token for caller identity.
-
-    hmac_secret
-    Shared secret used to sign request bodies.
-
-    allowed_clock_skew_seconds
-    Server acceptance window for timestamp drift.
-    """
-
     auth_token: str
     hmac_secret: str
     allowed_clock_skew_seconds: int = 60
@@ -33,14 +22,6 @@ def compute_signature(
     nonce: str,
     body_bytes: bytes,
 ) -> str:
-    """
-    Compute a stable HMAC signature.
-
-    We sign a canonical byte string:
-    timestamp newline nonce newline sha256(body)
-
-    Returning lowercase hex string.
-    """
     body_hash = hashlib.sha256(body_bytes).hexdigest()
     canonical = f"{timestamp}\n{nonce}\n{body_hash}".encode()
     mac = hmac.new(secret.encode("utf-8"), canonical, hashlib.sha256)
@@ -59,9 +40,6 @@ def require_header(headers: dict[str, str], key: str) -> str:
 
 
 def parse_bearer_token(auth_header: str) -> str:
-    """
-    Parse Authorization: Bearer TOKEN
-    """
     parts = auth_header.split()
     if len(parts) != 2:
         raise McpValidationError("invalid authorization header")
@@ -73,9 +51,6 @@ def parse_bearer_token(auth_header: str) -> str:
 
 
 def headers_to_dict(raw_headers: Any) -> dict[str, str]:
-    """
-     Convert headers into a lowercase keyed dict for case insensitive lookup.
-    """
     out: dict[str, str] = {}
     for k in raw_headers.keys():
         out[str(k).lower()] = str(raw_headers.get(k))
