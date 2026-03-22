@@ -144,6 +144,8 @@ class McpHandler(BaseHTTPRequestHandler):
                 encode_response_error(McpApiVersion.v1, request_id, err_code, err_msg),
             )
         except Exception as exc:
+            import traceback
+            traceback.print_exc()
             status_code = 500
             outcome = "error"
             err_code = "server_error"

@@ -4,7 +4,7 @@ import hashlib
 import hmac
 from dataclasses import dataclass
 from typing import Any
-
+from mcp_server.errors import McpValidationError
 
 @dataclass(frozen=True)
 class McpAuthConfig:
@@ -52,9 +52,9 @@ def constant_time_equal(a: str, b: str) -> bool:
 
 
 def require_header(headers: dict[str, str], key: str) -> str:
-    value = headers.get(key, "")
+    value = headers.get(key.lower(), "")
     if not value:
-        raise ValueError(f"missing header {key}")
+        raise McpValidationError(f"missing header {key}")
     return value
 
 
@@ -64,19 +64,19 @@ def parse_bearer_token(auth_header: str) -> str:
     """
     parts = auth_header.split()
     if len(parts) != 2:
-        raise ValueError("invalid authorization header")
+        raise McpValidationError("invalid authorization header")
     if parts[0].lower() != "bearer":
-        raise ValueError("invalid authorization scheme")
+        raise McpValidationError("invalid authorization scheme")
     if not parts[1]:
-        raise ValueError("empty token")
+        raise McpValidationError("empty token")
     return parts[1]
 
 
 def headers_to_dict(raw_headers: Any) -> dict[str, str]:
     """
-    Convert BaseHTTPRequestHandler headers into a plain dict.
+     Convert headers into a lowercase keyed dict for case insensitive lookup.
     """
     out: dict[str, str] = {}
     for k in raw_headers.keys():
-        out[str(k)] = str(raw_headers.get(k))
+        out[str(k).lower()] = str(raw_headers.get(k))
     return out

@@ -1,0 +1,6 @@
+{"duration_ms": 1, "error_code": "server_error", "error_message": "missing header X-MCP-Timestamp", "http_status": 500, "method": "unknown", "outcome": "error", "path": "/mcp", "request_id": "unknown", "ts_unix": 1774211695}
+{"duration_ms": 20, "error_code": "server_error", "error_message": "missing header X-MCP-Timestamp", "http_status": 500, "method": "unknown", "outcome": "error", "path": "/mcp", "request_id": "unknown", "ts_unix": 1774211888}
+{"duration_ms": 0, "error_code": "validation_error", "error_message": "missing header Authorization", "http_status": 400, "method": "unknown", "outcome": "reject", "path": "/mcp", "request_id": "unknown", "ts_unix": 1774212210}
+{"duration_ms": 0, "error_code": "validation_error", "error_message": "missing header X-MCP-Timestamp", "http_status": 400, "method": "unknown", "outcome": "reject", "path": "/mcp", "request_id": "unknown", "ts_unix": 1774212262}
+{"duration_ms": 0, "error_code": "validation_error", "error_message": "missing header X-MCP-Timestamp", "http_status": 400, "method": "unknown", "outcome": "reject", "path": "/mcp", "request_id": "unknown", "ts_unix": 1774212387}
+{"duration_ms": 0, "error_code": "server_error", "error_message": "unknown", "http_status": 200, "method": "evaluate_plan", "outcome": "ok", "path": "/mcp", "request_id": "test-plan-1", "ts_unix": 1774212644}
