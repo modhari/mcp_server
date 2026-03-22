@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from datacenter_orchestrator.mcp.errors import McpValidationError
-from datacenter_orchestrator.mcp.schemas import (
+from mcp_server.errors import McpValidationError
+from mcp_server.schemas import (
     McpApiVersion,
     McpError,
     McpMethod,
