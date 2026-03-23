@@ -1,173 +1,84 @@
+"""
+MCP Server API
+
+Simple HTTP server exposing /mcp endpoint for plan evaluation.
+"""
+
 from __future__ import annotations
 
 import json
-import time
-from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
 from typing import Any
 
-from mcp_server.audit import AuditLogger
-from mcp_server.codec import (
-    decode_request,
-    encode_response_error,
-    encode_response_ok,
-)
 from mcp_server.errors import McpValidationError
-from mcp_server.replay import NonceStore
-from mcp_server.schemas import McpApiVersion, McpMethod
-from mcp_server.security import (
-    McpAuthConfig,
-    compute_signature,
-    constant_time_equal,
-    headers_to_dict,
-    parse_bearer_token,
-    require_header,
-)
 
 
-@dataclass(frozen=True)
-class McpServerConfig:
-    auth: McpAuthConfig
-    audit_path: Path = Path("/tmp/mcp_audit.jsonl")
-    nonce_ttl_seconds: int = 300
-
-
-class McpHandler(BaseHTTPRequestHandler):
-    server_version = "mcp/1.0"
-
-    def _read_json_bytes(self) -> bytes:
-        length = int(self.headers.get("Content-Length", "0"))
-        return self.rfile.read(length)
-
-    def _send_json(self, status: int, payload: dict[str, Any]) -> None:
+class MCPRequestHandler(BaseHTTPRequestHandler):
+    def _send_json(self, code: int, payload: dict[str, Any]) -> None:
         body = json.dumps(payload).encode("utf-8")
-        self.send_response(status)
+        self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def do_POST(self) -> None:
-        cfg: McpServerConfig = self.server.mcp_config  # type: ignore[attr-defined]
-        audit: AuditLogger = self.server.mcp_audit  # type: ignore[attr-defined]
-        nonces: NonceStore = self.server.mcp_nonces  # type: ignore[attr-defined]
-
-        start = time.time()
-
         if self.path != "/mcp":
             self._send_json(
                 404,
-                encode_response_error(McpApiVersion.v1, "unknown", "not_found", "unknown endpoint"),
+                {
+                    "ok": False,
+                    "error": {"code": "not_found", "message": "unknown endpoint"},
+                },
             )
             return
 
-        request_id = "unknown"
-        status_code = 500
-        outcome = "error"
-        err_code = "server_error"
-        err_msg = "unknown"
-        method = "unknown"
-
         try:
-            headers = headers_to_dict(self.headers)
-
-            auth_header = require_header(headers, "Authorization")
-            token = parse_bearer_token(auth_header)
-            if not constant_time_equal(token, cfg.auth.auth_token):
-                raise McpValidationError("unauthorized")
-
-            ts = require_header(headers, "X-MCP-Timestamp")
-            nonce = require_header(headers, "X-MCP-Nonce")
-            sig = require_header(headers, "X-MCP-Signature")
-
-            now = int(time.time())
-            ts_int = int(ts)
-            skew = abs(now - ts_int)
-            if skew > cfg.auth.allowed_clock_skew_seconds:
-                raise McpValidationError("timestamp outside allowed skew window")
-
-            if nonces.seen_recently(nonce):
-                raise McpValidationError("replay detected")
-
-            body_bytes = self._read_json_bytes()
-
-            expected = compute_signature(
-                secret=cfg.auth.hmac_secret,
-                timestamp=ts,
-                nonce=nonce,
-                body_bytes=body_bytes,
-            )
-            if not constant_time_equal(sig, expected):
-                raise McpValidationError("invalid signature")
+            content_length = int(self.headers.get("Content-Length", "0"))
+            body_bytes = self.rfile.read(content_length)
 
             payload = json.loads(body_bytes.decode("utf-8"))
-            req = decode_request(payload)
 
-            request_id = req.request_id
-            method = req.method.value
+            print("=== MCP REQUEST ===", flush=True)
+            print(payload, flush=True)
+            print("===================", flush=True)
 
-            if req.method != McpMethod.evaluate_plan:
-                status_code = 400
-                outcome = "reject"
-                err_code = "unsupported_method"
-                err_msg = "method not supported"
-                self._send_json(
-                    400,
-                    encode_response_error(req.api_version, req.request_id, err_code, err_msg),
-                )
-                return
+            method = payload.get("method")
+            params = payload.get("params", {})
 
-            plan = req.params.get("plan")
-            inventory = req.params.get("inventory")
+            if method != "evaluate_plan":
+                raise McpValidationError(f"unsupported method: {method}")
 
-            if not isinstance(plan, dict):
-                raise McpValidationError("params.plan must be an object")
-            if not isinstance(inventory, dict):
-                raise McpValidationError("params.inventory must be an object")
+            plan = params.get("plan", {})
+            inventory = params.get("inventory", {})
 
-            risk = self._evaluate_plan_dicts(plan, inventory)
+            result = self._evaluate_plan_dicts(plan, inventory)
 
-            status_code = 200
-            outcome = "ok"
-            self._send_json(
-                200,
-                encode_response_ok(req.api_version, req.request_id, risk),
-            )
+            response = {
+                "api_version": "v1",
+                "request_id": payload.get("request_id", "unknown"),
+                "ok": True,
+                "result": result,
+            }
+
+            self._send_json(200, response)
 
         except McpValidationError as exc:
-            status_code = 400
-            outcome = "reject"
-            err_code = "validation_error"
-            err_msg = str(exc)
             self._send_json(
                 400,
-                encode_response_error(McpApiVersion.v1, request_id, err_code, err_msg),
+                {
+                    "ok": False,
+                    "error": {"code": "validation_error", "message": str(exc)},
+                },
             )
+
         except Exception as exc:
-            import traceback
-            traceback.print_exc()
-            status_code = 500
-            outcome = "error"
-            err_code = "server_error"
-            err_msg = str(exc)
             self._send_json(
                 500,
-                encode_response_error(McpApiVersion.v1, request_id, err_code, err_msg),
-            )
-        finally:
-            duration_ms = int((time.time() - start) * 1000.0)
-            audit.log(
                 {
-                    "request_id": request_id,
-                    "method": method,
-                    "http_status": status_code,
-                    "outcome": outcome,
-                    "error_code": err_code,
-                    "error_message": err_msg,
-                    "duration_ms": duration_ms,
-                    "path": self.path,
-                }
+                    "ok": False,
+                    "error": {"code": "internal_error", "message": str(exc)},
+                },
             )
 
     def _evaluate_plan_dicts(
@@ -175,26 +86,118 @@ class McpHandler(BaseHTTPRequestHandler):
         plan: dict[str, Any],
         inventory: dict[str, Any],
     ) -> dict[str, Any]:
-        _ = plan
-        _ = inventory
+        actions = plan.get("actions", [])
+        devices = inventory.get("devices", [])
+
+        if not isinstance(actions, list):
+            raise McpValidationError("plan.actions must be a list")
+        if not isinstance(devices, list):
+            raise McpValidationError("inventory.devices must be a list")
+
+        device_index: dict[str, dict[str, Any]] = {}
+        for dev in devices:
+            if isinstance(dev, dict):
+                name = str(dev.get("name", ""))
+                if name:
+                    device_index[name] = dev
+
+        touched_devices: list[str] = []
+        reasons: list[str] = []
+        evidence: dict[str, Any] = {
+            "device_count": len(devices),
+            "action_count": len(actions),
+            "touched_devices": [],
+            "change_types": [],
+        }
+
+        blast_radius_score = 0
+        risk_level = "low"
+        requires_approval = False
+
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+
+            device = str(action.get("device", ""))
+            model_paths = action.get("model_paths", {})
+            if not isinstance(model_paths, dict):
+                model_paths = {}
+
+            if device:
+                touched_devices.append(device)
+
+            change_types_for_action: list[str] = []
+
+            for path, value in model_paths.items():
+                path_str = str(path)
+
+                if "bgp/neighbors/neighbor" in path_str:
+                    change_types_for_action.append("bgp_neighbor_change")
+                    blast_radius_score += 40
+                    reasons.append(f"BGP neighbor change on {device}")
+
+                    if value is False:
+                        blast_radius_score += 30
+                        reasons.append(f"BGP neighbor disable requested on {device}")
+
+                elif "interfaces/interface" in path_str:
+                    change_types_for_action.append("interface_change")
+                    blast_radius_score += 15
+                    reasons.append(f"Interface configuration change on {device}")
+
+                    if value is False:
+                        blast_radius_score += 20
+                        reasons.append(f"Interface disable requested on {device}")
+
+                else:
+                    change_types_for_action.append("generic_config_change")
+                    blast_radius_score += 10
+                    reasons.append(f"Generic config change on {device}")
+
+            device_record = device_index.get(device)
+            if device_record:
+                role = str(device_record.get("role", ""))
+                if role == "spine":
+                    blast_radius_score += 25
+                    reasons.append(f"Change touches spine device {device}")
+                elif role == "leaf":
+                    blast_radius_score += 10
+                    reasons.append(f"Change touches leaf device {device}")
+
+                links = device_record.get("links", [])
+                if isinstance(links, list):
+                    blast_radius_score += min(len(links) * 5, 20)
+                    reasons.append(f"Topology fanout considered for {device}")
+
+            evidence["change_types"].extend(change_types_for_action)
+
+        unique_devices = sorted(set(touched_devices))
+        evidence["touched_devices"] = unique_devices
+
+        if blast_radius_score >= 70:
+            risk_level = "high"
+            requires_approval = True
+        elif blast_radius_score >= 35:
+            risk_level = "medium"
+            requires_approval = True
+        else:
+            risk_level = "low"
+            requires_approval = False
+
         return {
-            "risk_level": "high",
-            "blast_radius_score": 100,
-            "requires_approval": True,
-            "reasons": ["server adapter not yet bound to internal risk logic"],
-            "evidence": {},
+            "risk_level": risk_level,
+            "blast_radius_score": blast_radius_score,
+            "requires_approval": requires_approval,
+            "reasons": reasons,
+            "evidence": evidence,
         }
 
 
-class McpHttpServer(HTTPServer):
-    def __init__(self, host: str, port: int, config: McpServerConfig) -> None:
-        super().__init__((host, port), McpHandler)
-        self.mcp_config = config
-        self.mcp_audit = AuditLogger(path=config.audit_path)
-        self.mcp_nonces = NonceStore(ttl_seconds=config.nonce_ttl_seconds)
-
-
-def run_mcp_server(host: str, port: int, config: McpServerConfig) -> None:
-    server = McpHttpServer(host, port, config)
+def run_server(host: str = "0.0.0.0", port: int = 8080) -> None:
+    server = HTTPServer((host, port), MCPRequestHandler)
     print(f"mcp server listening on http://{host}:{port}/mcp")
     server.serve_forever()
+
+
+if __name__ == "__main__":
+    run_server()
