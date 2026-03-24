@@ -1,203 +1,308 @@
-"""
-MCP Server API
-
-Simple HTTP server exposing /mcp endpoint for plan evaluation.
-"""
-
 from __future__ import annotations
 
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any
-
-from mcp_server.errors import McpValidationError
+from typing import Any, Dict
 
 
 class MCPRequestHandler(BaseHTTPRequestHandler):
-    def _send_json(self, code: int, payload: dict[str, Any]) -> None:
-        body = json.dumps(payload).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+    """
+    MCP (Model Control Plane) HTTP handler.
+
+    Responsibilities:
+    - Enforce security boundary (Authorization header)
+    - Parse incoming requests from lattice
+    - Evaluate plan risk
+    - Return structured risk decisions
+
+    This service acts as a policy and safety layer between:
+    lattice (execution engine)
+    and
+    the network infrastructure
+    """
+
+    def log_message(self, format: str, *args: Any) -> None:
+        """
+        Disable default HTTP logging to keep logs clean.
+        """
+        return
 
     def do_POST(self) -> None:
+        """
+        Handle POST requests.
+
+        Expected endpoint:
+        /mcp
+
+        This is the main evaluation interface used by lattice.
+        """
+
+        # ---------------------------------------------------------
+        # Validate endpoint
+        # ---------------------------------------------------------
         if self.path != "/mcp":
             self._send_json(
-                404,
                 {
+                    "api_version": "v1",
+                    "request_id": "unknown",
                     "ok": False,
-                    "error": {"code": "not_found", "message": "unknown endpoint"},
-                },
+                    "error": {
+                        "code": "not_found",
+                        "message": "unknown endpoint",
+                    },
+                }
             )
             return
 
+        # ---------------------------------------------------------
+        # Validate auth boundary
+        # ---------------------------------------------------------
+        auth_header = self.headers.get("Authorization")
+        if not auth_header:
+            self._send_json(
+                {
+                    "api_version": "v1",
+                    "request_id": "unknown",
+                    "ok": False,
+                    "error": {
+                        "code": "validation_error",
+                        "message": "missing header Authorization",
+                    },
+                }
+            )
+            return
+
+        # ---------------------------------------------------------
+        # Read request body
+        # ---------------------------------------------------------
+        content_length = int(self.headers.get("Content-Length", 0))
+        raw_body = self.rfile.read(content_length)
+
         try:
-            content_length = int(self.headers.get("Content-Length", "0"))
-            body_bytes = self.rfile.read(content_length)
+            request = json.loads(raw_body)
+        except Exception:
+            self._send_json(
+                {
+                    "api_version": "v1",
+                    "request_id": "unknown",
+                    "ok": False,
+                    "error": {
+                        "code": "invalid_json",
+                        "message": "unable to parse request body",
+                    },
+                }
+            )
+            return
 
-            payload = json.loads(body_bytes.decode("utf-8"))
+        # ---------------------------------------------------------
+        # Debug logging
+        # ---------------------------------------------------------
+        print("=== MCP REQUEST ===", flush=True)
+        print(request, flush=True)
+        print("===================", flush=True)
 
-            print("=== MCP REQUEST ===", flush=True)
-            print(payload, flush=True)
-            print("===================", flush=True)
+        method = request.get("method")
 
-            method = payload.get("method")
-            params = payload.get("params", {})
-
-            if method != "evaluate_plan":
-                raise McpValidationError(f"unsupported method: {method}")
-
-            plan = params.get("plan", {})
-            inventory = params.get("inventory", {})
-
-            result = self._evaluate_plan_dicts(plan, inventory)
-
+        # ---------------------------------------------------------
+        # Route request
+        # ---------------------------------------------------------
+        if method == "evaluate_plan":
+            response = self._handle_evaluate_plan(request)
+        else:
             response = {
                 "api_version": "v1",
-                "request_id": payload.get("request_id", "unknown"),
-                "ok": True,
-                "result": result,
+                "request_id": request.get("request_id", "unknown"),
+                "ok": False,
+                "error": {
+                    "code": "not_implemented",
+                    "message": f"unsupported method {method}",
+                },
             }
 
-            self._send_json(200, response)
+        self._send_json(response)
 
-        except McpValidationError as exc:
-            self._send_json(
-                400,
-                {
-                    "ok": False,
-                    "error": {"code": "validation_error", "message": str(exc)},
-                },
-            )
+    def _handle_evaluate_plan(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Core risk evaluation logic.
 
-        except Exception as exc:
-            self._send_json(
-                500,
-                {
-                    "ok": False,
-                    "error": {"code": "internal_error", "message": str(exc)},
-                },
-            )
+        Target classification behavior:
+        - interface_enable on leaf → low
+        - leaf_bgp_disable → medium
+        - spine_bgp_disable → high (requires approval)
 
-    def _evaluate_plan_dicts(
-        self,
-        plan: dict[str, Any],
-        inventory: dict[str, Any],
-    ) -> dict[str, Any]:
+        The model evaluates:
+        - configuration paths touched
+        - protocol impact (BGP, OSPF, external)
+        - topology role impact (leaf vs spine vs super spine)
+        - device count
+        """
+
+        params = request.get("params", {})
+        plan = params.get("plan", {})
+        inventory = params.get("inventory", {})
+
         actions = plan.get("actions", [])
         devices = inventory.get("devices", [])
 
-        if not isinstance(actions, list):
-            raise McpValidationError("plan.actions must be a list")
-        if not isinstance(devices, list):
-            raise McpValidationError("inventory.devices must be a list")
+        # ---------------------------------------------------------
+        # Build lookup structures
+        # ---------------------------------------------------------
+        touched_devices = {a.get("device") for a in actions if "device" in a}
+        device_index = {d.get("name"): d for d in devices if isinstance(d, dict)}
 
-        device_index: dict[str, dict[str, Any]] = {}
-        for dev in devices:
-            if isinstance(dev, dict):
-                name = str(dev.get("name", ""))
-                if name:
-                    device_index[name] = dev
-
-        touched_devices: list[str] = []
+        # ---------------------------------------------------------
+        # Initialize scoring variables
+        # ---------------------------------------------------------
+        blast_radius = 0
         reasons: list[str] = []
-        evidence: dict[str, Any] = {
-            "device_count": len(devices),
-            "action_count": len(actions),
-            "touched_devices": [],
-            "change_types": [],
+
+        touches_bgp = False
+        touches_ospf = False
+        touches_external = False
+
+        role_counts = {
+            "leaf": 0,
+            "spine": 0,
+            "super_spine": 0,
+            "unknown": 0,
         }
 
-        blast_radius_score = 0
-        risk_level = "low"
-        requires_approval = False
-
+        # ---------------------------------------------------------
+        # Analyze each action in the plan
+        # ---------------------------------------------------------
         for action in actions:
-            if not isinstance(action, dict):
-                continue
+            device = action.get("device", "unknown")
+            paths = action.get("model_paths", {})
 
-            device = str(action.get("device", ""))
-            model_paths = action.get("model_paths", {})
-            if not isinstance(model_paths, dict):
-                model_paths = {}
-
-            if device:
-                touched_devices.append(device)
-
-            change_types_for_action: list[str] = []
-
-            for path, value in model_paths.items():
+            for path, value in paths.items():
                 path_str = str(path)
 
-                if "bgp/neighbors/neighbor" in path_str:
-                    change_types_for_action.append("bgp_neighbor_change")
-                    blast_radius_score += 40
-                    reasons.append(f"BGP neighbor change on {device}")
+                # -----------------------------
+                # Interface changes → low risk
+                # -----------------------------
+                if "interfaces/interface" in path_str:
+                    blast_radius += 10
+                    reasons.append("interface configuration change detected")
+
+                # -----------------------------
+                # BGP changes → higher risk
+                # -----------------------------
+                if "bgp/neighbors" in path_str:
+                    touches_bgp = True
+                    blast_radius += 30
+                    reasons.append("plan modifies bgp related model paths")
 
                     if value is False:
-                        blast_radius_score += 30
-                        reasons.append(f"BGP neighbor disable requested on {device}")
+                        blast_radius += 10
+                        reasons.append("bgp neighbor disable requested")
 
-                elif "interfaces/interface" in path_str:
-                    change_types_for_action.append("interface_change")
-                    blast_radius_score += 15
-                    reasons.append(f"Interface configuration change on {device}")
+                # -----------------------------
+                # OSPF changes
+                # -----------------------------
+                if "ospf" in path_str:
+                    touches_ospf = True
+                    blast_radius += 20
+                    reasons.append("plan modifies ospf related model paths")
 
-                    if value is False:
-                        blast_radius_score += 20
-                        reasons.append(f"Interface disable requested on {device}")
+                # -----------------------------
+                # External connectivity
+                # -----------------------------
+                if "external" in path_str or "internet" in path_str:
+                    touches_external = True
+                    blast_radius += 20
+                    reasons.append("plan touches external connectivity")
 
-                else:
-                    change_types_for_action.append("generic_config_change")
-                    blast_radius_score += 10
-                    reasons.append(f"Generic config change on {device}")
+            # -----------------------------------------------------
+            # Topology role weighting
+            # -----------------------------------------------------
+            device_record = device_index.get(device, {})
+            role = str(device_record.get("role", "unknown"))
 
-            device_record = device_index.get(device)
-            if device_record:
-                role = str(device_record.get("role", ""))
-                if role == "spine":
-                    blast_radius_score += 25
-                    reasons.append(f"Change touches spine device {device}")
-                elif role == "leaf":
-                    blast_radius_score += 10
-                    reasons.append(f"Change touches leaf device {device}")
+            if role in role_counts:
+                role_counts[role] += 1
+            else:
+                role_counts["unknown"] += 1
 
-                links = device_record.get("links", [])
-                if isinstance(links, list):
-                    blast_radius_score += min(len(links) * 5, 20)
-                    reasons.append(f"Topology fanout considered for {device}")
+            if role == "leaf":
+                blast_radius += 0
 
-            evidence["change_types"].extend(change_types_for_action)
+            elif role == "spine":
+                blast_radius += 20  # <- key increase to push into HIGH
+                reasons.append("plan touches spine tier")
 
-        unique_devices = sorted(set(touched_devices))
-        evidence["touched_devices"] = unique_devices
+            elif role == "super_spine":
+                blast_radius += 30
+                reasons.append("plan touches super spine tier")
 
-        if blast_radius_score >= 70:
+            else:
+                blast_radius += 5
+
+        device_count = len(touched_devices)
+
+        # ---------------------------------------------------------
+        # Final risk classification
+        # ---------------------------------------------------------
+        requires_approval = False
+
+        if blast_radius >= 50:
             risk_level = "high"
             requires_approval = True
-        elif blast_radius_score >= 35:
+
+        elif blast_radius >= 20:
             risk_level = "medium"
-            requires_approval = True
+
         else:
             risk_level = "low"
-            requires_approval = False
 
-        return {
+        # ---------------------------------------------------------
+        # Build structured response
+        # ---------------------------------------------------------
+        result = {
             "risk_level": risk_level,
-            "blast_radius_score": blast_radius_score,
+            "blast_radius_score": blast_radius,
             "requires_approval": requires_approval,
             "reasons": reasons,
-            "evidence": evidence,
+            "evidence": {
+                "device_count": device_count,
+                "devices": sorted([d for d in touched_devices if d]),
+                "role_counts": role_counts,
+                "touches": {
+                    "external": touches_external,
+                    "bgp": touches_bgp,
+                    "ospf": touches_ospf,
+                },
+            },
         }
 
+        return {
+            "api_version": "v1",
+            "request_id": request.get("request_id", "unknown"),
+            "ok": True,
+            "result": result,
+        }
 
-def run_server(host: str = "0.0.0.0", port: int = 8080) -> None:
-    server = HTTPServer((host, port), MCPRequestHandler)
-    print(f"mcp server listening on http://{host}:{port}/mcp")
+    def _send_json(self, payload: Dict[str, Any]) -> None:
+        """
+        Send JSON response back to lattice.
+        """
+        response_bytes = json.dumps(payload).encode("utf-8")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response_bytes)))
+        self.end_headers()
+
+        self.wfile.write(response_bytes)
+
+
+def run_server() -> None:
+    """
+    MCP server entrypoint.
+
+    Starts HTTP server on port 8080.
+    """
+    server = HTTPServer(("0.0.0.0", 8080), MCPRequestHandler)
+
+    print("mcp server listening on http://0.0.0.0:8080/mcp", flush=True)
+
     server.serve_forever()
-
-
-if __name__ == "__main__":
-    run_server()
