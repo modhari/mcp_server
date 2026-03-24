@@ -229,6 +229,11 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             elif role == "spine":
                 blast_radius += 20  # <- key increase to push into HIGH
                 reasons.append("plan touches spine tier")
+                
+                # Explicit escalation rule
+                if touches_bgp:
+                    blast_radius +=20
+                    reasons.append("spine + bgp change increases blast radius significantly")
 
             elif role == "super_spine":
                 blast_radius += 30
