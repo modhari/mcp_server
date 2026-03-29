@@ -6,8 +6,10 @@ from mcp_server.capabilities.bgp.correlation import build_grouped_incident
 from mcp_server.capabilities.bgp.models import (
     BgpEventRecord,
     BgpFinding,
+    BgpGroupedIncident,
     BgpLogRecord,
     BgpNeighborRecord,
+    BgpProposedAction,
     BgpRouteRecord,
     BgpSnapshot,
 )
@@ -15,8 +17,6 @@ from mcp_server.capabilities.bgp.models import (
 
 ESTABLISHED_STATES = {"established", "up"}
 
-# Severity ordering is used to keep findings stable and predictable for operators and tests.
-# Higher severity findings appear first in the response.
 SEVERITY_ORDER = {
     "critical": 0,
     "high": 1,
@@ -34,18 +34,10 @@ def analyze_bgp_snapshot(
     """
     Analyze a normalized BGP snapshot.
 
-    The troubleshooting flow mirrors the operator workflow:
-    1. session state first
-    2. route visibility across Adj RIB In, Loc RIB, and Adj RIB Out
-    3. best path hints
-    4. event based instability signals
-    5. correlated parent incident creation to reduce alert fatigue
-
-    Check in 3 improves response usability in these ways:
-    - findings are sorted in a stable order
-    - a diagnosis_counts section is returned
-    - a validation_summary section is returned
-    - output shape becomes easier to test automatically
+    Check in 4:
+    - Adds proposed actions
+    - Adds approval summary
+    - Keeps execution disabled
     """
 
     normalized = _normalize_snapshot(snapshot)
@@ -63,7 +55,6 @@ def analyze_bgp_snapshot(
     )
     findings.extend(_analyze_events(normalized.events, normalized.logs))
 
-    # Sort findings so the output is deterministic and test friendly.
     findings = _sort_findings(findings)
 
     grouped_incident = build_grouped_incident(
@@ -75,60 +66,53 @@ def analyze_bgp_snapshot(
     )
 
     recommended_actions = _build_recommendations(findings, grouped_incident)
+    proposed_actions = _build_proposed_actions(
+        fabric=fabric,
+        device=device,
+        findings=findings,
+        grouped_incident=grouped_incident,
+    )
+    approval_summary = _build_approval_summary(proposed_actions)
+
     summary, root_cause, confidence = _build_summary(findings, grouped_incident)
-    diagnosis_counts = _build_diagnosis_counts(findings)
-    validation_summary = _build_validation_summary(findings, grouped_incident)
 
     return {
         "summary": summary,
         "incident_type": (
-            "bgp_correlated_failure" if grouped_incident is not None else "bgp_diagnostic"
+            "bgp_correlated_failure" if grouped_incident else "bgp_diagnostic"
         ),
         "root_cause": root_cause,
         "confidence": confidence,
-        "snapshot_contract_version": "checkin_3",
-        "correlation_window_seconds": normalized.correlation_window_seconds,
-        "diagnosis_counts": diagnosis_counts,
-        "validation_summary": validation_summary,
-        "findings": [_finding_to_dict(finding) for finding in findings],
-        "grouped_events": (
-            grouped_incident.grouped_events if grouped_incident is not None else []
-        ),
-        "evidence": [finding.evidence for finding in findings],
+        "snapshot_contract_version": "checkin_4",
+        "approval_summary": approval_summary,
+        "findings": [_finding_to_dict(f) for f in findings],
         "recommended_actions": recommended_actions,
+        "proposed_actions": [_proposed_action_to_dict(a) for a in proposed_actions],
         "alert": (
             {
                 "dedupe_key": grouped_incident.dedupe_key,
                 "title": grouped_incident.title,
                 "impact_summary": grouped_incident.impact_summary,
-                "correlation_window_seconds": grouped_incident.correlation_window_seconds,
                 "child_incidents": [
                     {
-                        "finding_type": child.finding_type,
-                        "summary": child.summary,
-                        "peer": child.peer,
-                        "prefix": child.prefix,
-                        "severity": child.severity,
-                        "confidence": child.confidence,
-                        "occurred_at": child.occurred_at,
+                        "finding_type": c.finding_type,
+                        "summary": c.summary,
+                        "peer": c.peer,
+                        "severity": c.severity,
                     }
-                    for child in grouped_incident.child_incidents
+                    for c in grouped_incident.child_incidents
                 ],
                 "consolidated_logs": grouped_incident.consolidated_logs,
             }
-            if grouped_incident is not None
+            if grouped_incident
             else None
         ),
     }
-
-
 def _normalize_snapshot(raw_snapshot: dict[str, Any]) -> BgpSnapshot:
     """
-    Normalize a raw snapshot dict into the internal BgpSnapshot structure.
-
-    This gives the analyzer a predictable internal model while still allowing the request
-    body to be permissive during adoption.
+    Normalize a raw snapshot into the internal BGP snapshot model.
     """
+
     correlation_window_seconds = _safe_positive_int(
         raw_snapshot.get("correlation_window_seconds"),
         default=180,
@@ -204,7 +188,7 @@ def _normalize_snapshot(raw_snapshot: dict[str, Any]) -> BgpSnapshot:
 
 def _normalize_routes(raw_routes: Any) -> list[BgpRouteRecord]:
     """
-    Normalize route lists for Adj RIB In, Loc RIB, and Adj RIB Out.
+    Normalize route records from Adj RIB In, Loc RIB, and Adj RIB Out.
     """
     routes: list[BgpRouteRecord] = []
 
@@ -246,17 +230,11 @@ def _analyze_neighbor_sessions(
         last_error = neighbor.last_error
 
         if session_state not in ESTABLISHED_STATES:
-            summary = f"BGP session to {peer} is not established"
-            root_hint = (
-                str(shared_dependency)
-                if shared_dependency
-                else "peering_or_reachability_issue"
-            )
             findings.append(
                 BgpFinding(
                     finding_type="session_down",
                     severity="critical",
-                    summary=summary,
+                    summary=f"BGP session to {peer} is not established",
                     peer=peer,
                     confidence=0.92,
                     occurred_at=neighbor.last_event_at,
@@ -265,15 +243,15 @@ def _analyze_neighbor_sessions(
                         "shared_dependency": shared_dependency,
                         "last_error": last_error,
                         "address_family": neighbor.address_family,
-                        "root_cause_hint": root_hint,
+                        "root_cause_hint": str(
+                            shared_dependency or "peering_or_reachability_issue"
+                        ),
                     },
                     logs=_select_logs(logs, peer, session_state, last_error, shared_dependency),
                 )
             )
             continue
 
-        # Established but no received routes is often a sender or upstream issue before
-        # local policy has a chance to accept anything.
         if prefixes_received == 0:
             findings.append(
                 BgpFinding(
@@ -323,9 +301,7 @@ def _analyze_route_pipeline(
                 BgpFinding(
                     finding_type="inbound_policy_drop",
                     severity="high",
-                    summary=(
-                        f"Prefix {prefix} reached Adj RIB In but did not enter Loc RIB"
-                    ),
+                    summary=f"Prefix {prefix} reached Adj RIB In but did not enter Loc RIB",
                     peer=route.peer,
                     prefix=prefix,
                     confidence=0.88,
@@ -346,9 +322,7 @@ def _analyze_route_pipeline(
                 BgpFinding(
                     finding_type="outbound_policy_drop",
                     severity="high",
-                    summary=(
-                        f"Prefix {prefix} exists in Loc RIB but is absent from Adj RIB Out"
-                    ),
+                    summary=f"Prefix {prefix} exists in Loc RIB but is absent from Adj RIB Out",
                     peer=route.peer,
                     prefix=prefix,
                     confidence=0.86,
@@ -363,8 +337,6 @@ def _analyze_route_pipeline(
                 )
             )
 
-        # A route in Loc RIB without any best path marker is suspicious and worth
-        # surfacing even if the full BGP attribute set is not present yet.
         if loc_routes and not any(route.best for route in loc_routes):
             route = loc_routes[0]
             findings.append(
@@ -424,16 +396,14 @@ def _analyze_events(
             )
 
     return findings
-
-
 def _build_recommendations(
     findings: list[BgpFinding],
-    grouped_incident: Any,
+    grouped_incident: BgpGroupedIncident | None,
 ) -> list[dict[str, Any]]:
     """
     Build safe read only recommendations.
 
-    Check in 3 still keeps the system in Option A. All recommendations remain read only.
+    These remain operator guidance only.
     """
     recommendations: list[dict[str, Any]] = []
     seen_titles: set[str] = set()
@@ -496,9 +466,354 @@ def _build_recommendations(
     return recommendations
 
 
+def _build_proposed_actions(
+    *,
+    fabric: str,
+    device: str,
+    findings: list[BgpFinding],
+    grouped_incident: BgpGroupedIncident | None,
+) -> list[BgpProposedAction]:
+    """
+    Build proposed actions for Option B foundations.
+
+    Important:
+    These are proposals only.
+    No action is executed in this phase.
+    """
+    proposed: list[BgpProposedAction] = []
+    seen_ids: set[str] = set()
+
+    for finding in findings:
+        if finding.finding_type == "session_down":
+            proposed.append(
+                BgpProposedAction(
+                    action_id=f"validate_session:{finding.peer}",
+                    title="Validate BGP session inputs",
+                    summary=(
+                        f"Validate reachability and peering inputs for {finding.peer} before "
+                        f"considering any intrusive recovery step"
+                    ),
+                    action_type="read_only_validation",
+                    target={
+                        "fabric": fabric,
+                        "device": device,
+                        "peer": finding.peer,
+                    },
+                    rationale=(
+                        "The session is not established. Read only checks should happen before "
+                        "any reset or policy change."
+                    ),
+                    evidence=finding.evidence,
+                    risk_level="low",
+                    approval_required=False,
+                    prerequisites=[
+                        "Confirm underlay reachability to the peer",
+                        "Confirm ASN, update source, and transport settings",
+                        "Inspect the last known error and related logs",
+                    ],
+                    commands=[],
+                    rollback_hint=None,
+                )
+            )
+
+            proposed.append(
+                BgpProposedAction(
+                    action_id=f"propose_session_reset:{finding.peer}",
+                    title="Propose controlled BGP session reset",
+                    summary=(
+                        f"Potentially reset the session to {finding.peer} only after validating "
+                        f"reachability and configuration state"
+                    ),
+                    action_type="gated_remediation",
+                    target={
+                        "fabric": fabric,
+                        "device": device,
+                        "peer": finding.peer,
+                    },
+                    rationale=(
+                        "A session reset is disruptive and should only be considered after the "
+                        "operator confirms that it is appropriate."
+                    ),
+                    evidence=finding.evidence,
+                    risk_level="medium",
+                    approval_required=True,
+                    approval_reason="Session reset may withdraw routes and change traffic flow",
+                    blocked=True,
+                    blocked_reason="Execution is not enabled in Check in 4",
+                    prerequisites=[
+                        "Validate underlay reachability",
+                        "Validate remote ASN and update source",
+                        "Confirm that the failure is not due to a wider shared dependency",
+                    ],
+                    commands=[
+                        "clear bgp neighbor <peer> soft or hard reset depending on platform policy"
+                    ],
+                    rollback_hint=(
+                        "If the reset worsens impact, stop further resets and investigate "
+                        "the shared dependency"
+                    ),
+                )
+            )
+
+        elif finding.finding_type == "inbound_policy_drop":
+            proposed.append(
+                BgpProposedAction(
+                    action_id=f"validate_inbound_policy:{finding.prefix}",
+                    title="Validate inbound policy handling",
+                    summary=(
+                        f"Inspect inbound policy, route acceptance rules, and validation handling "
+                        f"for {finding.prefix}"
+                    ),
+                    action_type="read_only_validation",
+                    target={
+                        "fabric": fabric,
+                        "device": device,
+                        "prefix": finding.prefix,
+                        "peer": finding.peer,
+                    },
+                    rationale=(
+                        "The route appears in Adj RIB In but not in Loc RIB, which strongly points "
+                        "to inbound policy or validation handling."
+                    ),
+                    evidence=finding.evidence,
+                    risk_level="low",
+                    approval_required=False,
+                    prerequisites=[
+                        "Inspect inbound policy references",
+                        "Inspect route validation state",
+                        "Compare accepted and denied route counters if available",
+                    ],
+                    commands=[],
+                    rollback_hint=None,
+                )
+            )
+
+            proposed.append(
+                BgpProposedAction(
+                    action_id=f"propose_inbound_policy_change:{finding.prefix}",
+                    title="Propose inbound policy adjustment",
+                    summary=(
+                        f"Potentially adjust inbound policy logic affecting {finding.prefix} after "
+                        f"review and approval"
+                    ),
+                    action_type="gated_policy_change",
+                    target={
+                        "fabric": fabric,
+                        "device": device,
+                        "prefix": finding.prefix,
+                        "peer": finding.peer,
+                    },
+                    rationale=(
+                        "Changing route policy can alter accepted routes and blast radius beyond the "
+                        "single prefix if done incorrectly."
+                    ),
+                    evidence=finding.evidence,
+                    risk_level="high",
+                    approval_required=True,
+                    approval_reason="Policy changes may alter route acceptance across multiple prefixes",
+                    blocked=True,
+                    blocked_reason="Execution is not enabled in Check in 4",
+                    prerequisites=[
+                        "Review current policy and route match conditions",
+                        "Review expected import behavior",
+                        "Prepare explicit rollback policy or revert plan",
+                    ],
+                    commands=[
+                        "apply reviewed inbound route policy update through approved change path"
+                    ],
+                    rollback_hint="Rollback to the previous inbound policy revision",
+                )
+            )
+
+        elif finding.finding_type == "outbound_policy_drop":
+            proposed.append(
+                BgpProposedAction(
+                    action_id=f"validate_outbound_policy:{finding.prefix}",
+                    title="Validate outbound policy handling",
+                    summary=(
+                        f"Inspect outbound policy and advertisement eligibility for {finding.prefix}"
+                    ),
+                    action_type="read_only_validation",
+                    target={
+                        "fabric": fabric,
+                        "device": device,
+                        "prefix": finding.prefix,
+                        "peer": finding.peer,
+                    },
+                    rationale=(
+                        "The route appears in Loc RIB but not in Adj RIB Out, which strongly points "
+                        "to outbound policy or advertisement gating."
+                    ),
+                    evidence=finding.evidence,
+                    risk_level="low",
+                    approval_required=False,
+                    prerequisites=[
+                        "Inspect export policy and peer specific filters",
+                        "Inspect route advertisement counters if available",
+                        "Confirm that route eligibility conditions are met",
+                    ],
+                    commands=[],
+                    rollback_hint=None,
+                )
+            )
+
+        elif finding.finding_type == "peer_not_advertising":
+            proposed.append(
+                BgpProposedAction(
+                    action_id=f"validate_sender_advertisement:{finding.peer}",
+                    title="Validate sender side advertisement state",
+                    summary=(
+                        f"Inspect sender side Adj RIB Out and route generation state for {finding.peer}"
+                    ),
+                    action_type="read_only_validation",
+                    target={
+                        "fabric": fabric,
+                        "device": device,
+                        "peer": finding.peer,
+                    },
+                    rationale=(
+                        "The session is up but no routes were received. That often means the sender "
+                        "is not advertising or an upstream dependency is preventing route generation."
+                    ),
+                    evidence=finding.evidence,
+                    risk_level="low",
+                    approval_required=False,
+                    prerequisites=[
+                        "Inspect sender side export state",
+                        "Confirm route generation on the sender",
+                        "Inspect shared dependency such as route reflector or policy domain",
+                    ],
+                    commands=[],
+                    rollback_hint=None,
+                )
+            )
+
+        elif finding.finding_type == "session_unstable":
+            proposed.append(
+                BgpProposedAction(
+                    action_id=f"validate_instability:{finding.peer}",
+                    title="Validate session instability cause",
+                    summary=(
+                        f"Inspect transport instability, timer expiry patterns, and shared dependency "
+                        f"signals for {finding.peer}"
+                    ),
+                    action_type="read_only_validation",
+                    target={
+                        "fabric": fabric,
+                        "device": device,
+                        "peer": finding.peer,
+                    },
+                    rationale=(
+                        "Instability often reflects a deeper dependency issue. The safe path is to "
+                        "confirm the root issue before considering recovery actions."
+                    ),
+                    evidence=finding.evidence,
+                    risk_level="low",
+                    approval_required=False,
+                    prerequisites=[
+                        "Inspect recent logs around timer expiry or flap events",
+                        "Inspect dependency level failures",
+                        "Inspect whether multiple peers share the same instability pattern",
+                    ],
+                    commands=[],
+                    rollback_hint=None,
+                )
+            )
+
+        elif finding.finding_type == "best_path_issue":
+            proposed.append(
+                BgpProposedAction(
+                    action_id=f"validate_best_path:{finding.prefix}",
+                    title="Validate best path selection inputs",
+                    summary=(
+                        f"Inspect best path inputs and route attribute selection for {finding.prefix}"
+                    ),
+                    action_type="read_only_validation",
+                    target={
+                        "fabric": fabric,
+                        "device": device,
+                        "prefix": finding.prefix,
+                    },
+                    rationale=(
+                        "No best path is selected even though the prefix is in Loc RIB. The safe step "
+                        "is to validate attributes and selection evidence."
+                    ),
+                    evidence=finding.evidence,
+                    risk_level="low",
+                    approval_required=False,
+                    prerequisites=[
+                        "Inspect path attribute comparison inputs",
+                        "Inspect next hop reachability",
+                        "Inspect route eligibility and multipath state",
+                    ],
+                    commands=[],
+                    rollback_hint=None,
+                )
+            )
+
+    if grouped_incident is not None:
+        proposed.append(
+            BgpProposedAction(
+                action_id=f"grouped_incident_review:{grouped_incident.root_cause}",
+                title="Review grouped incident before approving any remediation",
+                summary=(
+                    "Treat the correlated incident as the parent problem and avoid approving "
+                    "repeated child actions until the shared dependency is understood"
+                ),
+                action_type="coordination_guidance",
+                target={
+                    "fabric": fabric,
+                    "device": device,
+                    "root_cause": grouped_incident.root_cause,
+                },
+                rationale=(
+                    "When several symptoms share one dependency, approval should focus on the "
+                    "shared issue rather than many repetitive child remediations."
+                ),
+                evidence={
+                    "dedupe_key": grouped_incident.dedupe_key,
+                    "child_count": len(grouped_incident.child_incidents),
+                },
+                risk_level="low",
+                approval_required=False,
+                prerequisites=[
+                    "Review the parent incident evidence bundle",
+                    "Confirm the shared dependency",
+                    "Avoid duplicate approvals for equivalent child actions",
+                ],
+                commands=[],
+                rollback_hint=None,
+            )
+        )
+
+    unique: list[BgpProposedAction] = []
+    for action in proposed:
+        if action.action_id in seen_ids:
+            continue
+        seen_ids.add(action.action_id)
+        unique.append(action)
+
+    return unique
+
+
+def _build_approval_summary(proposed_actions: list[BgpProposedAction]) -> dict[str, Any]:
+    """
+    Summarize approval needs across the proposed actions.
+    """
+    approval_required_count = sum(1 for action in proposed_actions if action.approval_required)
+    blocked_count = sum(1 for action in proposed_actions if action.blocked)
+
+    return {
+        "has_proposed_actions": bool(proposed_actions),
+        "approval_required_count": approval_required_count,
+        "blocked_count": blocked_count,
+        "execution_enabled": False,
+    }
+
+
 def _build_summary(
     findings: list[BgpFinding],
-    grouped_incident: Any,
+    grouped_incident: BgpGroupedIncident | None,
 ) -> tuple[str, str, float]:
     if grouped_incident is not None:
         return (
@@ -519,43 +834,9 @@ def _build_summary(
     return (top.summary, root_cause, top.confidence)
 
 
-def _build_diagnosis_counts(findings: list[BgpFinding]) -> dict[str, int]:
-    """
-    Build counts by finding type.
-
-    This is useful for validation, dashboards, and future Kafka aggregation summaries.
-    """
-    counts: dict[str, int] = {}
-    for finding in findings:
-        counts[finding.finding_type] = counts.get(finding.finding_type, 0) + 1
-    return counts
-
-
-def _build_validation_summary(
-    findings: list[BgpFinding],
-    grouped_incident: Any,
-) -> dict[str, Any]:
-    """
-    Build a compact validation summary that is easy to assert in tests.
-    """
-    return {
-        "finding_count": len(findings),
-        "has_grouped_alert": grouped_incident is not None,
-        "highest_severity": findings[0].severity if findings else "info",
-        "top_finding_type": findings[0].finding_type if findings else None,
-    }
-
-
 def _sort_findings(findings: list[BgpFinding]) -> list[BgpFinding]:
     """
     Sort findings in a deterministic order.
-
-    Order:
-    severity
-    confidence descending
-    finding type
-    peer
-    prefix
     """
     return sorted(
         findings,
@@ -567,15 +848,6 @@ def _sort_findings(findings: list[BgpFinding]) -> list[BgpFinding]:
             finding.prefix or "",
         ),
     )
-
-
-def _index_routes(routes: list[BgpRouteRecord]) -> dict[str, list[BgpRouteRecord]]:
-    indexed: dict[str, list[BgpRouteRecord]] = {}
-    for route in routes:
-        if not route.prefix:
-            continue
-        indexed.setdefault(route.prefix, []).append(route)
-    return indexed
 
 
 def _finding_to_dict(finding: BgpFinding) -> dict[str, Any]:
@@ -592,12 +864,38 @@ def _finding_to_dict(finding: BgpFinding) -> dict[str, Any]:
     }
 
 
+def _proposed_action_to_dict(action: BgpProposedAction) -> dict[str, Any]:
+    return {
+        "action_id": action.action_id,
+        "title": action.title,
+        "summary": action.summary,
+        "action_type": action.action_type,
+        "target": action.target,
+        "rationale": action.rationale,
+        "evidence": action.evidence,
+        "risk_level": action.risk_level,
+        "approval_required": action.approval_required,
+        "approval_reason": action.approval_reason,
+        "blocked": action.blocked,
+        "blocked_reason": action.blocked_reason,
+        "prerequisites": action.prerequisites,
+        "commands": action.commands,
+        "rollback_hint": action.rollback_hint,
+    }
+
+
+def _index_routes(routes: list[BgpRouteRecord]) -> dict[str, list[BgpRouteRecord]]:
+    indexed: dict[str, list[BgpRouteRecord]] = {}
+    for route in routes:
+        if not route.prefix:
+            continue
+        indexed.setdefault(route.prefix, []).append(route)
+    return indexed
+
+
 def _select_logs(logs: list[BgpLogRecord], *terms: Any) -> list[str]:
     """
     Select relevant log lines for a finding.
-
-    The goal is not perfect ranking yet, but enough useful evidence so the grouped alert
-    carries readable operator context.
     """
     normalized_terms = [str(term).lower() for term in terms if term not in (None, "")]
     if not normalized_terms:

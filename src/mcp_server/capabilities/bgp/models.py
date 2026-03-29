@@ -59,7 +59,7 @@ class BgpEventRecord:
 
     occurred_at should be an ISO like string when available.
     The analyzer keeps it as a string so we do not force timestamp formatting at the
-    Lattice edge for Check in 2.
+    Lattice edge for this phase.
     """
 
     event_type: str
@@ -94,7 +94,6 @@ class BgpSnapshot:
     """
     Top level normalized BGP snapshot.
 
-    This is the contract Check in 2 wants Lattice to move toward.
     correlation_window_seconds is used by the grouping logic to decide whether multiple
     raw symptoms belong to one parent incident.
     """
@@ -162,3 +161,35 @@ class BgpGroupedIncident:
     grouped_events: list[dict[str, Any]] = field(default_factory=list)
     consolidated_logs: list[str] = field(default_factory=list)
     evidence: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class BgpProposedAction:
+    """
+    Proposed action returned by Option B foundations.
+
+    Important:
+    This is still a proposal only.
+    No action is executed in this phase.
+
+    approval_required is explicit so downstream systems know whether the action can be
+    shown as guidance only or must be routed into a formal approval flow.
+
+    risk_level is action specific rather than incident wide.
+    """
+
+    action_id: str
+    title: str
+    summary: str
+    action_type: str
+    target: dict[str, Any] = field(default_factory=dict)
+    rationale: str = ""
+    evidence: dict[str, Any] = field(default_factory=dict)
+    risk_level: str = "low"
+    approval_required: bool = False
+    approval_reason: str | None = None
+    blocked: bool = False
+    blocked_reason: str | None = None
+    prerequisites: list[str] = field(default_factory=list)
+    commands: list[str] = field(default_factory=list)
+    rollback_hint: str | None = None
