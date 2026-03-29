@@ -108,6 +108,7 @@ def analyze_bgp_snapshot(
             else None
         ),
     }
+
 def _normalize_snapshot(raw_snapshot: dict[str, Any]) -> BgpSnapshot:
     """
     Normalize a raw snapshot into the internal BGP snapshot model.
@@ -118,61 +119,124 @@ def _normalize_snapshot(raw_snapshot: dict[str, Any]) -> BgpSnapshot:
         default=180,
     )
 
-    neighbors = [
-        BgpNeighborRecord(
-            peer=str(item.get("peer") or item.get("neighbor") or "unknown"),
-            session_state=str(item.get("session_state", "unknown")),
-            prefixes_received=_maybe_int(item.get("prefixes_received")),
-            prefixes_accepted=_maybe_int(item.get("prefixes_accepted")),
-            prefixes_advertised=_maybe_int(item.get("prefixes_advertised")),
-            best_path_count=_maybe_int(item.get("best_path_count")),
-            shared_dependency=_maybe_str(item.get("shared_dependency")),
-            last_error=_maybe_str(item.get("last_error")),
-            last_event_at=_maybe_str(item.get("last_event_at")),
-            address_family=str(item.get("address_family", "ipv4_unicast")),
-            metadata=_safe_dict(item.get("metadata")),
-        )
-        for item in _as_list(raw_snapshot.get("neighbors"))
-        if isinstance(item, dict)
-    ]
+    raw_neighbors = _as_list(raw_snapshot.get("neighbors"))
+    raw_events = _as_list(raw_snapshot.get("events"))
 
-    adj_rib_in = _normalize_routes(raw_snapshot.get("adj_rib_in"))
-    loc_rib = _normalize_routes(raw_snapshot.get("loc_rib"))
-    adj_rib_out = _normalize_routes(raw_snapshot.get("adj_rib_out"))
+    # ---------------------------
+    # NEIGHBOR SYNTHESIS (FIX 1)
+    # ---------------------------
+    if raw_neighbors:
+        neighbors = [
+            BgpNeighborRecord(
+                peer=str(item.get("peer") or item.get("neighbor") or "unknown"),
+                session_state=str(item.get("session_state", "unknown")),
+                prefixes_received=_maybe_int(item.get("prefixes_received")),
+                prefixes_accepted=_maybe_int(item.get("prefixes_accepted")),
+                prefixes_advertised=_maybe_int(item.get("prefixes_advertised")),
+                best_path_count=_maybe_int(item.get("best_path_count")),
+                shared_dependency=_maybe_str(item.get("shared_dependency")),
+                last_error=_maybe_str(item.get("last_error")),
+                last_event_at=_maybe_str(item.get("last_event_at") or item.get("timestamp")),
+                address_family=str(item.get("address_family", "ipv4_unicast")),
+                metadata=_safe_dict(item.get("metadata")),
+            )
+            for item in raw_neighbors
+            if isinstance(item, dict)
+        ]
+    else:
+        neighbors = []
+        seen = set()
 
+        for item in raw_events:
+            if not isinstance(item, dict):
+                continue
+
+            peer = str(item.get("peer") or "").strip()
+            session_state = str(item.get("session_state") or "").strip()
+
+            if not peer:
+                continue
+
+            if not any(k in item for k in ("session_state", "prefixes_received", "last_error")):
+                continue
+
+            key = (peer, session_state, item.get("shared_dependency"))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            neighbors.append(
+                BgpNeighborRecord(
+                    peer=peer,
+                    session_state=session_state or "unknown",
+                    prefixes_received=_maybe_int(item.get("prefixes_received")),
+                    shared_dependency=_maybe_str(item.get("shared_dependency")),
+                    last_error=_maybe_str(item.get("last_error")),
+                    last_event_at=_maybe_str(item.get("timestamp")),
+                    address_family=str(item.get("address_family", "ipv4_unicast")),
+                )
+            )
+
+    # ---------------------------
+    # ROUTE PIPELINE (FIX 2)
+    # ---------------------------
+    raw_adj_rib_in = raw_snapshot.get("adj_rib_in")
+    raw_loc_rib = raw_snapshot.get("loc_rib")
+    raw_adj_rib_out = raw_snapshot.get("adj_rib_out")
+
+    adj_rib_in = _normalize_routes(raw_adj_rib_in)
+    loc_rib = _normalize_routes(raw_loc_rib)
+    adj_rib_out = _normalize_routes(raw_adj_rib_out)
+
+    if not adj_rib_in and not loc_rib:
+        for item in raw_events:
+            if not isinstance(item, dict):
+                continue
+
+            prefix = item.get("prefix")
+            table = item.get("table")
+
+            if not prefix:
+                continue
+
+            if table == "adj_rib_in_to_loc_rib":
+                adj_rib_in.append(
+                    BgpRouteRecord(
+                        prefix=str(prefix),
+                        peer=_maybe_str(item.get("peer")),
+                        reason=_maybe_str(item.get("reason")),
+                        shared_dependency=_maybe_str(item.get("shared_dependency")),
+                        address_family=str(item.get("address_family", "ipv4_unicast")),
+                    )
+                )
+
+            elif table == "loc_rib_to_adj_rib_out":
+                loc_rib.append(
+                    BgpRouteRecord(
+                        prefix=str(prefix),
+                        peer=_maybe_str(item.get("peer")),
+                        reason=_maybe_str(item.get("reason")),
+                        shared_dependency=_maybe_str(item.get("shared_dependency")),
+                        address_family=str(item.get("address_family", "ipv4_unicast")),
+                    )
+                )
+
+    # ---------------------------
+    # EVENTS + LOGS (unchanged)
+    # ---------------------------
     events = [
         BgpEventRecord(
             event_type=str(item.get("type") or item.get("event_type") or "unknown"),
             peer=_maybe_str(item.get("peer")),
             prefix=_maybe_str(item.get("prefix")),
             shared_dependency=_maybe_str(item.get("shared_dependency")),
-            severity=str(item.get("severity", "warning")),
-            occurred_at=_maybe_str(item.get("occurred_at")),
-            message=_maybe_str(item.get("message")),
-            metadata=_safe_dict(item.get("metadata")),
+            occurred_at=_maybe_str(item.get("timestamp")),
         )
-        for item in _as_list(raw_snapshot.get("events"))
+        for item in raw_events
         if isinstance(item, dict)
     ]
 
     logs = []
-    for item in _as_list(raw_snapshot.get("logs")):
-        if isinstance(item, str):
-            logs.append(BgpLogRecord(message=item))
-            continue
-
-        if isinstance(item, dict):
-            logs.append(
-                BgpLogRecord(
-                    message=str(item.get("message", "")),
-                    occurred_at=_maybe_str(item.get("occurred_at")),
-                    source=_maybe_str(item.get("source")),
-                    peer=_maybe_str(item.get("peer")),
-                    prefix=_maybe_str(item.get("prefix")),
-                    shared_dependency=_maybe_str(item.get("shared_dependency")),
-                    metadata=_safe_dict(item.get("metadata")),
-                )
-            )
 
     return BgpSnapshot(
         correlation_window_seconds=correlation_window_seconds,
@@ -182,9 +246,7 @@ def _normalize_snapshot(raw_snapshot: dict[str, Any]) -> BgpSnapshot:
         adj_rib_out=adj_rib_out,
         events=events,
         logs=logs,
-        metadata=_safe_dict(raw_snapshot.get("metadata")),
     )
-
 
 def _normalize_routes(raw_routes: Any) -> list[BgpRouteRecord]:
     """
