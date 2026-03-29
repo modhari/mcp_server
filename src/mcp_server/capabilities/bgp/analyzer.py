@@ -15,6 +15,15 @@ from mcp_server.capabilities.bgp.models import (
 
 ESTABLISHED_STATES = {"established", "up"}
 
+# Severity ordering is used to keep findings stable and predictable for operators and tests.
+# Higher severity findings appear first in the response.
+SEVERITY_ORDER = {
+    "critical": 0,
+    "high": 1,
+    "warning": 2,
+    "info": 3,
+}
+
 
 def analyze_bgp_snapshot(
     *,
@@ -32,8 +41,11 @@ def analyze_bgp_snapshot(
     4. event based instability signals
     5. correlated parent incident creation to reduce alert fatigue
 
-    Check in 2 introduces a stronger normalized snapshot contract while still accepting
-    permissive payloads so the integration can evolve safely.
+    Check in 3 improves response usability in these ways:
+    - findings are sorted in a stable order
+    - a diagnosis_counts section is returned
+    - a validation_summary section is returned
+    - output shape becomes easier to test automatically
     """
 
     normalized = _normalize_snapshot(snapshot)
@@ -51,6 +63,9 @@ def analyze_bgp_snapshot(
     )
     findings.extend(_analyze_events(normalized.events, normalized.logs))
 
+    # Sort findings so the output is deterministic and test friendly.
+    findings = _sort_findings(findings)
+
     grouped_incident = build_grouped_incident(
         fabric=fabric,
         device=device,
@@ -61,6 +76,8 @@ def analyze_bgp_snapshot(
 
     recommended_actions = _build_recommendations(findings, grouped_incident)
     summary, root_cause, confidence = _build_summary(findings, grouped_incident)
+    diagnosis_counts = _build_diagnosis_counts(findings)
+    validation_summary = _build_validation_summary(findings, grouped_incident)
 
     return {
         "summary": summary,
@@ -69,8 +86,10 @@ def analyze_bgp_snapshot(
         ),
         "root_cause": root_cause,
         "confidence": confidence,
-        "snapshot_contract_version": "checkin_2",
+        "snapshot_contract_version": "checkin_3",
         "correlation_window_seconds": normalized.correlation_window_seconds,
+        "diagnosis_counts": diagnosis_counts,
+        "validation_summary": validation_summary,
         "findings": [_finding_to_dict(finding) for finding in findings],
         "grouped_events": (
             grouped_incident.grouped_events if grouped_incident is not None else []
@@ -107,8 +126,8 @@ def _normalize_snapshot(raw_snapshot: dict[str, Any]) -> BgpSnapshot:
     """
     Normalize a raw snapshot dict into the internal BgpSnapshot structure.
 
-    This is the main Check in 2 improvement. It gives the analyzer a predictable internal
-    model while still allowing the request body to be permissive during adoption.
+    This gives the analyzer a predictable internal model while still allowing the request
+    body to be permissive during adoption.
     """
     correlation_window_seconds = _safe_positive_int(
         raw_snapshot.get("correlation_window_seconds"),
@@ -414,7 +433,7 @@ def _build_recommendations(
     """
     Build safe read only recommendations.
 
-    Check in 2 keeps the system firmly in Option A. All recommendations are read only.
+    Check in 3 still keeps the system in Option A. All recommendations remain read only.
     """
     recommendations: list[dict[str, Any]] = []
     seen_titles: set[str] = set()
@@ -500,6 +519,56 @@ def _build_summary(
     return (top.summary, root_cause, top.confidence)
 
 
+def _build_diagnosis_counts(findings: list[BgpFinding]) -> dict[str, int]:
+    """
+    Build counts by finding type.
+
+    This is useful for validation, dashboards, and future Kafka aggregation summaries.
+    """
+    counts: dict[str, int] = {}
+    for finding in findings:
+        counts[finding.finding_type] = counts.get(finding.finding_type, 0) + 1
+    return counts
+
+
+def _build_validation_summary(
+    findings: list[BgpFinding],
+    grouped_incident: Any,
+) -> dict[str, Any]:
+    """
+    Build a compact validation summary that is easy to assert in tests.
+    """
+    return {
+        "finding_count": len(findings),
+        "has_grouped_alert": grouped_incident is not None,
+        "highest_severity": findings[0].severity if findings else "info",
+        "top_finding_type": findings[0].finding_type if findings else None,
+    }
+
+
+def _sort_findings(findings: list[BgpFinding]) -> list[BgpFinding]:
+    """
+    Sort findings in a deterministic order.
+
+    Order:
+    severity
+    confidence descending
+    finding type
+    peer
+    prefix
+    """
+    return sorted(
+        findings,
+        key=lambda finding: (
+            SEVERITY_ORDER.get(finding.severity, 99),
+            -finding.confidence,
+            finding.finding_type,
+            finding.peer or "",
+            finding.prefix or "",
+        ),
+    )
+
+
 def _index_routes(routes: list[BgpRouteRecord]) -> dict[str, list[BgpRouteRecord]]:
     indexed: dict[str, list[BgpRouteRecord]] = {}
     for route in routes:
@@ -527,8 +596,8 @@ def _select_logs(logs: list[BgpLogRecord], *terms: Any) -> list[str]:
     """
     Select relevant log lines for a finding.
 
-    We keep this logic simple and transparent. The goal is not perfect ranking yet, but
-    providing enough evidence so the grouped alert carries useful operator context.
+    The goal is not perfect ranking yet, but enough useful evidence so the grouped alert
+    carries readable operator context.
     """
     normalized_terms = [str(term).lower() for term in terms if term not in (None, "")]
     if not normalized_terms:
