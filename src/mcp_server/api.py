@@ -4,17 +4,18 @@ import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any, Dict
 
+from mcp_server.capabilities.bgp import analyze_bgp_snapshot
 from mcp_server.capabilities.trace_ecmp import trace_ecmp_path
 
 
 class MCPRequestHandler(BaseHTTPRequestHandler):
     """
-    MCP (Model Control Plane) HTTP handler.
+    MCP HTTP handler.
 
     Responsibilities:
-    - Enforce auth boundary
-    - Route MCP methods
-    - Act as policy + capability execution layer
+    enforce auth boundary
+    route MCP methods
+    act as policy and capability execution layer
     """
 
     def log_message(self, format: str, *args: Any) -> None:
@@ -59,6 +60,8 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
             response = self._handle_evaluate_plan(request)
         elif method == "trace_ecmp_path":
             response = self._handle_trace_ecmp_path(request)
+        elif method == "analyze_bgp":
+            response = self._handle_analyze_bgp(request)
         else:
             response = self._error(
                 "not_implemented",
@@ -133,6 +136,56 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 },
             }
 
+    def _handle_analyze_bgp(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Execute deterministic BGP troubleshooting.
+
+        This endpoint is read only for Check in 1. It accepts a normalized snapshot that
+        Lattice can assemble from Netconfig and YANG gRPC reads and returns a structured
+        diagnosis plus a grouped alert when many child symptoms point to one root cause.
+        """
+        params = request.get("params", {})
+        fabric = str(params.get("fabric", "default"))
+        device = str(params.get("device", ""))
+        snapshot = params.get("snapshot", {})
+
+        if not device:
+            return self._error(
+                "validation_error",
+                "missing required field device",
+                request,
+            )
+
+        if not isinstance(snapshot, dict):
+            return self._error(
+                "validation_error",
+                "snapshot must be an object",
+                request,
+            )
+
+        try:
+            result = analyze_bgp_snapshot(
+                fabric=fabric,
+                device=device,
+                snapshot=snapshot,
+            )
+            return {
+                "api_version": "v1",
+                "request_id": request.get("request_id", "unknown"),
+                "ok": True,
+                "result": result,
+            }
+        except Exception as exc:
+            return {
+                "api_version": "v1",
+                "request_id": request.get("request_id", "unknown"),
+                "ok": False,
+                "error": {
+                    "code": "bgp_analysis_failed",
+                    "message": str(exc),
+                },
+            }
+
     def _handle_evaluate_plan(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """
         Deterministic plan risk evaluation logic.
@@ -181,7 +234,7 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 if touches_bgp:
                     blast_radius += 20
                     reasons.append(
-                        "spine + bgp change increases blast radius significantly"
+                        "spine plus bgp change increases blast radius significantly"
                     )
 
         requires_approval = blast_radius >= 50
@@ -202,6 +255,9 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
                 "blast_radius_score": blast_radius,
                 "requires_approval": requires_approval,
                 "reasons": reasons,
+                "touched_devices": sorted(
+                    str(device_name) for device_name in touched_devices if device_name
+                ),
             },
         }
 

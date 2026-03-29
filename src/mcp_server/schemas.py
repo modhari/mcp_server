@@ -11,6 +11,8 @@ class McpApiVersion(StrEnum):
 
 class McpMethod(StrEnum):
     evaluate_plan = "evaluate_plan"
+    trace_ecmp_path = "trace_ecmp_path"
+    analyze_bgp = "analyze_bgp"
 
 
 @dataclass(frozen=True)
